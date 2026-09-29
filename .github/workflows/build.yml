@@ -1,0 +1,117 @@
+# Builds PONGO from the PRIVATE source repo (mordf0kas/Pongo) and publishes the installers here.
+# Runs in this public repo because Actions minutes are free for public repos; the source is fetched
+# with a read-only deploy key (secret PONGO_SRC_KEY) and never stored here. Only the installers
+# end up public, in the release.
+# Run it by hand: Actions -> build -> Run workflow.
+name: build
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch / tag / commit of mordf0kas/Pongo to build"
+        default: main
+      windows:
+        description: "Also build the Windows installer (PongoVST-Setup.exe)"
+        type: boolean
+        default: true
+      publish:
+        description: "Upload the installers to release v<version> here (version from CMakeLists.txt)"
+        type: boolean
+        default: true
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Skip Windows unless asked
+        id: gate
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ] && [ "${{ inputs.windows }}" != "true" ]; then echo "run=false" >> "$GITHUB_OUTPUT"; else echo "run=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Fetch the source (private repo, read-only deploy key)
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: mordf0kas/Pongo
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.PONGO_SRC_KEY }}
+          persist-credentials: false
+      - name: Fetch JUCE 8.0.6 + DaisySP
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          git clone --branch 8.0.6 --depth 1 https://github.com/juce-framework/JUCE.git JUCE
+          git clone --depth 1 https://github.com/electro-smith/DaisySP.git DaisySP
+          git clone --depth 1 https://github.com/electro-smith/DaisySP-LGPL.git DaisySP/DaisySP-LGPL
+          # GCC-only __attribute__((optimize)) in ladder.cpp breaks MSVC/Clang
+          perl -0777 -pi -e 'if (!/__GNUC__/) { s/__attribute__\(\(optimize\("unroll-loops"\)\)\) void/#if defined(__GNUC__) && !defined(__clang__)\n__attribute__((optimize("unroll-loops")))\n#endif\nvoid/; }' DaisySP/Source/Filters/ladder.cpp
+      - name: Configure
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          else
+            cmake -B build
+          fi
+      - name: Build VST3 + Standalone
+        if: steps.gate.outputs.run == 'true'
+        run: cmake --build build --config Release --target PongoVST_VST3 PongoVST_Standalone --parallel 4
+      - name: Build AU (macOS)
+        if: steps.gate.outputs.run == 'true' && matrix.os == 'macos-latest'
+        run: cmake --build build --config Release --target PongoVST_AU --parallel 4
+      - name: Package macOS installer (.pkg inside PongoVST.dmg)
+        if: steps.gate.outputs.run == 'true' && matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Re-signs every bundle (JUCE writes moduleinfo.json after signing), builds the
+          # non-relocatable .pkg with the quarantine-stripping postinstall, wraps it in the .dmg.
+          bash installer/macos/build_pkg.sh build/PongoVST_artefacts/Release
+          mkdir -p out
+          cp installer/macos/PongoVST.dmg out/
+          sed -n 's/^project(PongoVST VERSION \([0-9.]*\)).*/\1/p' CMakeLists.txt > out/VERSION
+          ls -la out
+      - name: Package Windows installer (Inno Setup)
+        if: steps.gate.outputs.run == 'true' && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path CMakeLists.txt -Pattern 'project\(PongoVST VERSION ([0-9.]+)\)').Matches[0].Groups[1].Value
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\windows\PongoVST.iss
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item installer\windows\Output\PongoVST-Setup.exe out\
+          Set-Content -Path out\VERSION -Value $v -NoNewline
+      - uses: actions/upload-artifact@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          name: PONGO-${{ matrix.os }}
+          path: out
+
+  release:
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload to the release
+        run: |
+          VERSION=$(tr -d '\r\n' < dist/VERSION); TAG="v$VERSION"
+          FILES=(); for f in dist/PongoVST*; do [ -s "$f" ] && FILES+=("$f"); done
+          [ ${#FILES[@]} -gt 0 ] || { echo "::error::nothing to upload"; exit 1; }
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+          else
+            gh release create "$TAG" "${FILES[@]}" --title "PONGO $TAG" --notes "PONGO $TAG"
+          fi
+          printf 'Uploaded to %s:\n%s\n' "$TAG" "$(ls dist)" >> "$GITHUB_STEP_SUMMARY"
