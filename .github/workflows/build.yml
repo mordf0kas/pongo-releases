@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.os }}" = "macos-latest" ]; then
-            cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
           else
             cmake -B build
           fi
@@ -75,6 +75,9 @@ jobs:
           bash installer/macos/build_pkg.sh build/PongoVST_artefacts/Release
           mkdir -p out
           cp installer/macos/PongoVST.dmg out/
+          # Ship the raw .pkg too: macos_pkg_minos.py can audit a .pkg but not a .dmg,
+          # so without this the minimum macOS version of a release cannot be checked.
+          cp installer/macos/PONGO-Installer.pkg out/
           sed -n 's/^project(PongoVST VERSION \([0-9.]*\)).*/\1/p' CMakeLists.txt > out/VERSION
           ls -la out
       - name: Package Windows installer (Inno Setup)
@@ -107,7 +110,9 @@ jobs:
       - name: Upload to the release
         run: |
           VERSION=$(tr -d '\r\n' < dist/VERSION); TAG="v$VERSION"
-          FILES=(); for f in dist/PongoVST*; do [ -s "$f" ] && FILES+=("$f"); done
+          # The .pkg is renamed to match the other plugins' assets (Motion-v1.0-macOS.pkg and so on).
+          if [ -s dist/PONGO-Installer.pkg ]; then mv dist/PONGO-Installer.pkg "dist/PONGO-$TAG-macOS.pkg"; fi
+          FILES=(); for f in dist/PongoVST* dist/PONGO-*-macOS.pkg; do [ -s "$f" ] && FILES+=("$f"); done
           [ ${#FILES[@]} -gt 0 ] || { echo "::error::nothing to upload"; exit 1; }
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" "${FILES[@]}" --clobber
